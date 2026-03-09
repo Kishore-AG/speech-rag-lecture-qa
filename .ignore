@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env
+.env.*
+
+# Model cache
+.cache/
+huggingface/
+
+# Large ML files
+*.bin
+*.pt
+*.pth
+
+# FAISS index
+*.faiss
+*.index
+
+# Dataset / audio files
+data/audio/
+data/raw_audio/
+data/transcripts/
+data/chunks/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temporary
+*.tmp

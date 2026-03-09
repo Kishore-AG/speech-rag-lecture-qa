@@ -1,0 +1,17 @@
+torch
+torchaudio
+openai-whisper
+transformers
+sentence-transformers
+faiss-cpu
+librosa
+soundfile
+datasets
+evaluate
+accelerate
+scikit-learn
+numpy
+pandas
+tqdm
+rank_bm25
+faiss-gpu-cu12
