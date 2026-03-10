@@ -1,12 +1,17 @@
-# preprocess.py — Hybrid Semantic + Agentic Chunking with Comprehensive Noise Cleaning
-# NOISE TYPES HANDLED (all via pattern rules — zero hardcoded words/names):
-# TYPE 1 — Short isolated utterances ("Okay.", "Yeah.", "Hmm.", "Right.")
-# TYPE 2 — Repeated sentence blocks (Whisper repeats same sentence 2-5 times)
-# TYPE 3 — Non-ASCII / Cyrillic characters (Whisper hallucinates foreign scripts)
-# TYPE 4 — Letter-by-letter spelled names ("T-A-R-I-K")
-# TYPE 5 — ASR filler words (um, uh, hmm, mhm, etc.)
-# TYPE 6 — Consecutive repeated words ("it could be that it could be that")
-# NOTE: Garbled names are LLM-handled as proper nouns; production fix = custom ASR vocabulary
+"""
+Lecture Transcript Preprocessing Module
+Hybrid semantic + agentic chunking with comprehensive noise cleaning.
+
+NOISE TYPES HANDLED (pattern-based, not hardcoded):
+- TYPE 1: Short isolated utterances ("Okay.", "Yeah.", "Hmm.")
+- TYPE 2: Repeated sentence blocks (Whisper duplicates)
+- TYPE 3: Non-ASCII/Cyrillic characters
+- TYPE 4: Letter-by-letter spelled names ("T-A-R-I-K")
+- TYPE 5: ASR filler words (um, uh, hmm, etc.)
+- TYPE 6: Consecutive repeated words
+
+Uses semantic similarity + LLM for intelligent topic boundary detection.
+"""
 
 import os
 import re
@@ -16,52 +21,36 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import T5Tokenizer, T5ForConditionalGeneration
+from config import (
+    TRANSCRIPT_DIR, CHUNKS_FILE, PREPROCESS_CONFIG,
+    TOPIC_BOUNDARY_PROMPT
+)
 
-
-# ── Config ───────────────────────────────────────────────────────────────────
-
-TRANSCRIPT_DIR = "data/transcripts"
-OUTPUT_FILE    = "data/chunks/chunks.json"
-
-AUTO_CONFIRM_THRESHOLD = 0.42   # Tier 1: auto-split (clearly different topics)
-SEMANTIC_THRESHOLD     = 0.55   # Tier 2: ask Flan-T5 for ambiguous zone
-
-MIN_CHUNK_WORDS          = 40
-MAX_CHUNK_WORDS          = 200
-MIN_SENTENCES_FOR_HYBRID = 15
-FIXED_CHUNK_SIZE         = 180
-FIXED_OVERLAP            = 45
-
-# True ASR vocal noise — no content words
-FILLER_WORDS = {
-    "um", "uh", "hmm", "hm", "ah", "er", "eh", "umm", "uhh", "mhm"
-}
-
-
-# ── Models ───────────────────────────────────────────────────────────────────
-
-print("Loading models...")
-embedding_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-tokenizer       = T5Tokenizer.from_pretrained("google/flan-t5-large")
-llm             = T5ForConditionalGeneration.from_pretrained("google/flan-t5-large")
+# Load models once at startup
+print("Loading models for preprocessing...")
+embedding_model = SentenceTransformer(PREPROCESS_CONFIG["embedding_model"])
+tokenizer = T5Tokenizer.from_pretrained(PREPROCESS_CONFIG["llm_model"])
+llm = T5ForConditionalGeneration.from_pretrained(PREPROCESS_CONFIG["llm_model"])
 print("Models ready.\n")
 
 
-# ── Noise Cleaning (applied to raw text BEFORE sentence splitting) ────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# NOISE CLEANING (applied to raw text BEFORE sentence splitting)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def strip_non_ascii(text):
-    # TYPE 3: Remove non-ASCII/Cyrillic chars outside ASCII range (0-127)
+    """TYPE 3: Remove non-ASCII/Cyrillic characters outside ASCII range."""
     return re.sub(r'[^\x00-\x7F]+', ' ', text)
 
 
 def strip_spelled_names(text):
-    # TYPE 4: Remove letter-by-letter spelled sequences like "T-A-R-I-K" (2+ uppercase letters with hyphens)
+    """TYPE 4: Remove letter-by-letter spelled sequences like 'T-A-R-I-K'."""
     return re.sub(r'\b([A-Z]-){2,}[A-Z]\b', '', text)
 
 
 def remove_isolated_utterances(text):
-    # TYPE 1: Remove standalone utterances ≤ 3 words ("Okay.", "Yeah.", etc.)
-    parts    = re.split(r'(?<=[.?!])\s+', text)
+    """TYPE 1: Remove standalone utterances <= 3 words."""
+    parts = re.split(r'(?<=[.?!])\s+', text)
     filtered = []
     for part in parts:
         word_count = len(part.split())
@@ -71,10 +60,10 @@ def remove_isolated_utterances(text):
 
 
 def deduplicate_sentences(text):
-    # TYPE 2: Remove repeated sentence blocks using sliding window of 5 sentences
+    """TYPE 2: Remove repeated sentence blocks using sliding window."""
     sentences = re.split(r'(?<=[.?!])\s+', text)
     seen_window = []
-    deduped     = []
+    deduped = []
     for sent in sentences:
         normalized = sent.strip().lower()
         if normalized and normalized not in seen_window:
@@ -86,17 +75,19 @@ def deduplicate_sentences(text):
 
 
 def clean_raw_transcript(raw_text):
-    # Apply all raw-text noise cleaners in sequence before sentence splitting
+    """Apply all raw-text noise cleaners in sequence."""
     text = raw_text
-    text = strip_non_ascii(text)  # TYPE 3: Remove non-ASCII/Cyrillic
+    text = strip_non_ascii(text)  # TYPE 3: Remove non-ASCII
     text = strip_spelled_names(text)  # TYPE 4: Strip spelled names
-    text = deduplicate_sentences(text)  # TYPE 2: Deduplicate repeated sentences
+    text = deduplicate_sentences(text)  # TYPE 2: Deduplicate repetitions
     text = remove_isolated_utterances(text)  # TYPE 1: Remove isolated utterances
     text = re.sub(r'\s+', ' ', text).strip()  # Normalize whitespace
     return text
 
 
-# ── Sentence-Level Cleaning ───────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# SENTENCE-LEVEL CLEANING
+# ──────────────────────────────────────────────────────────────────────────────
 
 def split_into_sentences(raw_text):
     """
@@ -108,13 +99,13 @@ def split_into_sentences(raw_text):
 
 
 def clean_sentence(sentence):
-    # Clean sentence: lowercase, remove filler words (TYPE 5), deduplicate words (TYPE 6), strip punctuation
-    text  = sentence.lower().replace("\n", " ")
+    """Clean sentence: lowercase, remove filler words, deduplicate words."""
+    text = sentence.lower().replace("\n", " ")
     words = text.split()
     cleaned = []
     for word in words:
         word = re.sub(r"[^\w']", "", word)
-        if not word or word in FILLER_WORDS:
+        if not word or word in PREPROCESS_CONFIG["filler_words"]:
             continue
         if cleaned and word == cleaned[-1]:
             continue
@@ -122,51 +113,66 @@ def clean_sentence(sentence):
     return " ".join(cleaned).strip()
 
 
-# ── Stage 1: Semantic Scoring ─────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# STAGE 1: SEMANTIC SCORING
+# ──────────────────────────────────────────────────────────────────────────────
 
 def embed_sentences(sentences):
+    """Generate embeddings for sentence list."""
     return embedding_model.encode(sentences, show_progress_bar=False)
 
 
 def score_all_boundaries(embeddings):
-    # Compute cosine similarity between adjacent sentence pairs
+    """Compute cosine similarity between adjacent sentence pairs."""
     candidates = []
+    threshold = PREPROCESS_CONFIG["semantic_threshold"]
     for i in range(len(embeddings) - 1):
         sim = cosine_similarity(
             embeddings[i].reshape(1, -1),
             embeddings[i + 1].reshape(1, -1)
         )[0][0]
-        if sim < SEMANTIC_THRESHOLD:
+        if sim < threshold:
             candidates.append((i, round(float(sim), 3)))
     return candidates
 
 
-# ── Stage 2: Two-Tier Boundary Confirmation ───────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# STAGE 2: TWO-TIER BOUNDARY CONFIRMATION
+# ──────────────────────────────────────────────────────────────────────────────
 
 def agentic_confirm_pair(sent_a, sent_b):
-    # Ask Flan-T5 if two sentences discuss different topics
-    prompt = f"""Do these two sentences discuss different topics? Answer only yes or no.
-
-Sentence 1: {sent_a}
-Sentence 2: {sent_b}
-
-Answer:"""
-    inputs  = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256)
-    outputs = llm.generate(inputs.input_ids, max_new_tokens=5, num_beams=2, early_stopping=True)
-    answer  = tokenizer.decode(outputs[0], skip_special_tokens=True).strip().lower()
+    """
+    Use LLM to determine if two sentences discuss different topics.
+    Returns True if they are a topic boundary, False otherwise.
+    """
+    prompt = TOPIC_BOUNDARY_PROMPT.format(sent_a=sent_a, sent_b=sent_b)
+    
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256)
+    outputs = llm.generate(
+        inputs.input_ids,
+        max_new_tokens=5,
+        num_beams=2,
+        early_stopping=True
+    )
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip().lower()
     return answer.startswith("yes")
 
 
 def get_confirmed_boundaries(sentences, candidates):
-    # Two-tier routing: Tier 1 = auto-confirm (low similarity), Tier 2 = ask Flan-T5 (ambiguous zone)
-    confirmed   = []
+    """
+    Two-tier routing:
+    - Tier 1: Auto-confirm boundaries with very low similarity
+    - Tier 2: Ask LLM for ambiguous boundaries
+    """
+    confirmed = []
     tier1_count = 0
     tier2_count = 0
+    auto_threshold = PREPROCESS_CONFIG["auto_confirm_threshold"]
 
     print(f"    Total candidates  : {len(candidates)}")
 
     for idx, sim in candidates:
-        if sim < AUTO_CONFIRM_THRESHOLD:
+        if sim < auto_threshold:
             confirmed.append(idx)
             tier1_count += 1
             print(f"      ✓ AUTO     [{idx:3d}→{idx+1}] sim={sim}: "
@@ -192,10 +198,13 @@ def get_confirmed_boundaries(sentences, candidates):
     return confirmed
 
 
-# ── Stage 3: Build + Guard ────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# STAGE 3: BUILD CHUNKS & APPLY GUARDS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def build_raw_chunks(sentences, boundaries):
-    boundary_set    = set(boundaries)
+    """Build chunks from sentence boundaries."""
+    boundary_set = set(boundaries)
     chunks, current = [], []
     for i, sent in enumerate(sentences):
         current.append(sent)
@@ -208,87 +217,123 @@ def build_raw_chunks(sentences, boundaries):
 
 
 def recursive_split(chunk):
-    # Recursively split at word midpoint until chunk ≤ MAX_CHUNK_WORDS
+    """Recursively split oversized chunks at word midpoint."""
     words = chunk.split()
-    if len(words) <= MAX_CHUNK_WORDS:
+    max_words = PREPROCESS_CONFIG["max_chunk_words"]
+    if len(words) <= max_words:
         return [chunk]
     mid = len(words) // 2
-    return (recursive_split(" ".join(words[:mid])) + recursive_split(" ".join(words[mid:])))
+    return (recursive_split(" ".join(words[:mid])) + 
+            recursive_split(" ".join(words[mid:])))
 
 
 def size_guard(chunks):
-    # Merge undersized chunks, recursively split oversized chunks
+    """Merge undersized chunks, recursively split oversized chunks."""
+    min_words = PREPROCESS_CONFIG["min_chunk_words"]
+    max_words = PREPROCESS_CONFIG["max_chunk_words"]
+    
     merged, buffer = [], ""
     for chunk in chunks:
         if buffer:
             combined = (buffer + " " + chunk).strip()
-            if len(combined.split()) >= MIN_CHUNK_WORDS:
+            if len(combined.split()) >= min_words:
                 merged.append(combined)
                 buffer = ""
             else:
                 buffer = combined
         else:
-            if len(chunk.split()) < MIN_CHUNK_WORDS:
+            if len(chunk.split()) < min_words:
                 buffer = chunk
             else:
                 merged.append(chunk)
     if buffer:
-        if merged: merged[-1] = (merged[-1] + " " + buffer).strip()
-        else:      merged.append(buffer)
+        if merged:
+            merged[-1] = (merged[-1] + " " + buffer).strip()
+        else:
+            merged.append(buffer)
+
     guarded = []
     for chunk in merged:
         guarded.extend(recursive_split(chunk))
     return [c.strip() for c in guarded if c.strip()]
 
 
-# ── Fallback ──────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# FALLBACK: FIXED-SIZE CHUNKING
+# ──────────────────────────────────────────────────────────────────────────────
 
 def fixed_chunk(text):
-    # Fixed-size chunking with overlap (fallback method)
+    """Fixed-size chunking with overlap (fallback method)."""
+    chunk_size = PREPROCESS_CONFIG["fixed_chunk_size"]
+    overlap = PREPROCESS_CONFIG["fixed_overlap"]
+    
     words, chunks, i = text.split(), [], 0
     while i < len(words):
-        chunk = " ".join(words[i:i + FIXED_CHUNK_SIZE])
+        chunk = " ".join(words[i:i + chunk_size])
         if chunk.strip():
             chunks.append(chunk)
-        i += FIXED_CHUNK_SIZE - FIXED_OVERLAP
+        i += chunk_size - overlap
     return chunks
 
 
-# ── Full Pipeline ─────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# FULL PIPELINE
+# ──────────────────────────────────────────────────────────────────────────────
 
 def hybrid_chunk(raw_text, filename=""):
-    # Full hybrid pipeline with comprehensive noise cleaning
+    """Full hybrid pipeline with comprehensive noise cleaning."""
     cleaned_raw = clean_raw_transcript(raw_text)
     raw_sentences = split_into_sentences(cleaned_raw)
     print(f"  Sentences after noise clean + filter: {len(raw_sentences)}")
-    if len(raw_sentences) < MIN_SENTENCES_FOR_HYBRID:
+    
+    min_sentences = PREPROCESS_CONFIG["min_sentences_for_hybrid"]
+    if len(raw_sentences) < min_sentences:
         print(f"  ⚠ Too few sentences — using fixed fallback")
-        clean  = " ".join(clean_sentence(s) for s in raw_sentences)
+        clean = " ".join(clean_sentence(s) for s in raw_sentences)
         chunks = fixed_chunk(clean)
-        return [{"text": c, "chunk_method": "fixed_fallback", "word_count": len(c.split())} for c in chunks if c.strip()]
+        return [
+            {
+                "text": c,
+                "chunk_method": "fixed_fallback",
+                "word_count": len(c.split())
+            }
+            for c in chunks if c.strip()
+        ]
+
     cleaned = [clean_sentence(s) for s in raw_sentences]
     cleaned = [s for s in cleaned if s.strip()]
+    
     print(f"  [Stage 1] Embedding {len(cleaned)} sentences...")
     embeddings = embed_sentences(cleaned)
     candidates = score_all_boundaries(embeddings)
-    tier1 = sum(1 for _, sim in candidates if sim < AUTO_CONFIRM_THRESHOLD)
+    tier1 = sum(1 for _, sim in candidates if sim < PREPROCESS_CONFIG["auto_confirm_threshold"])
     tier2 = len(candidates) - tier1
     print(f"  [Stage 1] Candidates: {len(candidates)} (Tier1={tier1} auto, Tier2={tier2} agentic)")
 
-    # Stage 2: Two-tier confirmation | Stage 3: Build chunks and apply size guard
     print(f"  [Stage 2] Two-tier confirmation...")
     confirmed = get_confirmed_boundaries(cleaned, candidates)
-    raw_chunks   = build_raw_chunks(cleaned, confirmed)
+    raw_chunks = build_raw_chunks(cleaned, confirmed)
     final_chunks = size_guard(raw_chunks)
     print(f"  [Stage 3] Raw: {len(raw_chunks)} → After size guard: {len(final_chunks)}")
-    return [{"text": chunk, "chunk_method": "hybrid", "word_count": len(chunk.split())} for chunk in final_chunks if chunk.strip()]
+    
+    return [
+        {
+            "text": chunk,
+            "chunk_method": "hybrid",
+            "word_count": len(chunk.split())
+        }
+        for chunk in final_chunks if chunk.strip()
+    ]
 
 
-# ── Process All ───────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────── 
+# PROCESS ALL TRANSCRIPTS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def process_transcripts():
+    """Process all transcripts in TRANSCRIPT_DIR and save chunks."""
     all_chunks = []
-    chunk_id   = 0
+    chunk_id = 0
 
     transcript_files = sorted(
         f for f in os.listdir(TRANSCRIPT_DIR) if f.endswith(".txt")
@@ -317,23 +362,24 @@ def process_transcripts():
 
         for chunk in chunks:
             all_chunks.append({
-                "chunk_id":     chunk_id,
-                "source_file":  filename,
-                "text":         chunk["text"],
+                "chunk_id": chunk_id,
+                "source_file": filename,
+                "text": chunk["text"],
                 "chunk_method": chunk["chunk_method"],
-                "word_count":   chunk["word_count"],
+                "word_count": chunk["word_count"],
             })
             chunk_id += 1
 
-    os.makedirs("data/chunks", exist_ok=True)
+    os.makedirs(os.path.dirname(CHUNKS_FILE), exist_ok=True)
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    with open(CHUNKS_FILE, "w", encoding="utf-8") as f:
         json.dump(all_chunks, f, indent=2)
 
-    wc      = [c["word_count"] for c in all_chunks]
+    wc = [c["word_count"] for c in all_chunks]
+    max_words = PREPROCESS_CONFIG["max_chunk_words"]
     h_count = sum(1 for c in all_chunks if c["chunk_method"] == "hybrid")
     f_count = sum(1 for c in all_chunks if c["chunk_method"] == "fixed_fallback")
-    over    = [c for c in all_chunks if c["word_count"] > MAX_CHUNK_WORDS]
+    over = [c for c in all_chunks if c["word_count"] > max_words]
 
     print(f"\n{'═'*60}")
     print(f"CHUNKING SUMMARY")
@@ -343,8 +389,8 @@ def process_transcripts():
     print(f"  Fixed fallback      : {f_count}")
     print(f"  Avg words per chunk : {sum(wc)/len(wc):.1f}")
     print(f"  Min / Max           : {min(wc)} / {max(wc)}")
-    print(f"  Oversized (>{MAX_CHUNK_WORDS}w)   : {len(over)}  ← should be 0")
-    print(f"\n  Saved → {OUTPUT_FILE}")
+    print(f"  Oversized (>{max_words}w)   : {len(over)}  ← should be 0")
+    print(f"\n  Saved → {CHUNKS_FILE}")
 
 
 if __name__ == "__main__":

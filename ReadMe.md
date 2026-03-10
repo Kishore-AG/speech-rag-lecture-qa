@@ -2,25 +2,26 @@
 
 ## Project Overview
 
-**Speech RAG Lecture Q&A** is an advanced Retrieval-Augmented Generation (RAG) system designed to answer questions about lecture content using transcribed audio. The system combines automatic speech recognition, semantic chunking, hybrid retrieval (semantic + keyword-based), and large language models to provide accurate, contextually-grounded answers.
+**Speech RAG Lecture Q&A** is an advanced Retrieval-Augmented Generation (RAG) system designed to answer questions about lecture content using transcribed audio. The system combines automatic speech recognition, semantic chunking, hybrid retrieval (semantic + keyword-based), large language models, and hierarchical summarization to provide accurate, contextually-grounded answers and full lecture summaries.
 
-This project demonstrates a production-ready pipeline for processing lecture transcripts, building searchable knowledge bases, and enabling natural language question-answering over lecture materials.
+This project demonstrates a production-ready pipeline for processing lecture transcripts, building searchable knowledge bases, and enabling natural language question-answering and summarization over lecture materials.
 
 ---
 
 ## What We've Built (Completed Components)
 
 ### 1. **Automatic Speech Recognition (ASR)**
-- **File**: `src/asr.py`
+- **File**: `asr.py`
 - **Technology**: OpenAI Whisper (base model)
 - **Functionality**:
-  - Converts audio files (WAV format) from `data/audio/` to text transcripts
-  - Saves transcripts to `data/transcripts/lecture_N.txt`
+  - Converts audio files (WAV, MP3, M4A, FLAC, OGG) from `data/audio/` to text transcripts
+  - Saves transcripts to `data/transcripts/`
   - Supports batch processing of multiple audio files
+  - Skips files with existing transcripts (incremental)
   - Handles various audio qualities automatically
 
 ### 2. **Advanced Text Preprocessing with Hybrid Chunking**
-- **File**: `src/preprocess.py`
+- **File**: `preprocess.py`
 - **Key Features**:
   - **Comprehensive Noise Cleaning** (6 types of ASR artifacts removed):
     - Isolated short utterances (e.g., "Okay.", "Yeah.")
@@ -37,18 +38,18 @@ This project demonstrates a production-ready pipeline for processing lecture tra
   - Output: Structured JSON with chunks, source files, and metadata
 
 ### 3. **Semantic Vector Indexing**
-- **File**: `src/build_index.py`
-- **Technology**: 
+- **File**: `build_index.py`
+- **Technology**:
   - SentenceTransformer (BGE-small-en-v1.5) for embeddings
   - FAISS for efficient vector search
 - **Functionality**:
   - Encodes all text chunks into 384-dimensional embeddings
   - Builds FAISS IndexFlatL2 for semantic similarity search
-  - Saves index and metadata for retrieval pipeline
+  - Saves index and metadata to `data/indexes/`
   - Optimized for CPU/GPU deployment
 
 ### 4. **Hybrid Question-Answering System**
-- **File**: `src/qa.py`
+- **File**: `qa.py`
 - **Advanced Features**:
 
   **Query Processing**:
@@ -73,14 +74,26 @@ This project demonstrates a production-ready pipeline for processing lecture tra
   - Strict single-sentence output format
   - Temperature-controlled generation (0.3 for factual answers)
 
+### 5. **Hierarchical Lecture Summarization** *(New)*
+- **File**: `summary.py`
+- **Technology**: Microsoft Phi-3-mini-4k-instruct
+- **Functionality**:
+  - Loads all preprocessed chunks and joins them into a full transcript
+  - Splits transcript into large token-based sections (~2500 tokens each) to fit model context
+  - Summarizes each section independently using strict factual rules
+  - Combines section summaries into a single coherent final lecture summary
+  - Uses Phi-3's **native chat template** (`apply_chat_template`) for correct instruction following
+  - `repetition_penalty` set to `1.0` (disabled) to prevent synonym hallucination artifacts
+  - `do_sample=False` for deterministic, factual output
+- **Output**: Printed final summary with clear section boundaries
+
 ---
 
 ## System Architecture
 
 ### Overall Pipeline
-
 ```
-Audio Files (WAV)
+Audio Files
       ↓
   [ASR Module] (whisper)
       ↓
@@ -92,11 +105,16 @@ Chunks + Metadata (JSON)
       ↓
 [Embedding Generation] (SentenceTransformer)
       ↓
-FAISS Index + Metadata
+FAISS Index + Metadata (data/indexes/)
       ↓
-[QA System] (hybrid retrieval → reranking → LLM generation)
-      ↓
-Grounded Answers
+    ┌──────────────────────┐
+    │                      │
+[QA System]         [Summarization]
+(hybrid retrieval    (hierarchical
+→ reranking →        section-based
+→ LLM generation)    → Phi-3-mini)
+    │                      │
+Grounded Answers     Lecture Summary
 ```
 
 ### Component Architecture
@@ -105,8 +123,6 @@ Grounded Answers
 ```
 Audio Input → Whisper Model → Text Transcript
 ```
-- Single ResponsibilityPrinciple: transcription only
-- Pre-processing and cleaning handled downstream
 
 #### **2. Preprocessing Pipeline**
 ```
@@ -128,18 +144,13 @@ Raw Transcript
 Chunks with Method Tags (hybrid/fixed_fallback)
 ```
 
-**Key Design Decisions**:
-- Clean raw text before sentence splitting (noise interferes with sentence detection)
-- Two-tier boundary confirmation: auto-confirm clear boundaries, use LLM for ambiguous zones
-- Hierarchical guard: merge undersized → split oversized (ensures 40-200 word range)
-
 #### **3. Vector Indexing**
 ```
 Chunks → [SentenceTransformer] → Embeddings (384-dim)
               ↓
 [FAISS IndexFlatL2] ← Efficient vector search
               ↓
-Saved to disk (faiss_index.bin + faiss_metadata.json)
+Saved to data/indexes/ (faiss_index.bin + faiss_metadata.json)
 ```
 
 #### **4. Question-Answering Architecture**
@@ -169,10 +180,26 @@ User Question
 Grounded Answer
 ```
 
+#### **5. Summarization Architecture** *(New)*
+```
+chunks.json
+      ↓
+[Token-Based Section Splitting] (~2500 tokens/section)
+      ↓
+[Per-Section Summarization]
+  ├─ Phi-3-mini via native chat template
+  ├─ do_sample=False (deterministic)
+  └─ repetition_penalty=1.0 (hallucination fix)
+      ↓
+[Final Summary Generation]
+  └─ Combines all section summaries → coherent full summary
+      ↓
+Printed Final Lecture Summary
+```
+
 ---
 
 ## Data Flow and File Structure
-
 ```
 data/
 ├── audio/                    # Input: RAW AUDIO FILES
@@ -186,19 +213,22 @@ data/
 │   └── lecture_3.txt
 │
 ├── chunks/                   # GENERATED: PREPROCESSED CHUNKS
-│   ├── chunks.json           # Main chunk database
-│   └── faiss_metadata.json   # Metadata for indexing
+│   └── chunks.json           # Main chunk database
 │
-└── faiss_index.bin          # GENERATED: VECTOR INDEX
+└── indexes/                  # GENERATED: VECTOR INDEX (New)
+    ├── faiss_index.bin
+    └── faiss_metadata.json
 
 src/
-├── asr.py                   # Audio → Transcripts
-├── preprocess.py            # Transcripts → Chunks (hybrid semantic chunking)
-├── build_index.py           # Chunks → FAISS index
-└── qa.py                    # Index → Answers (hybrid retrieval + RAG)
+├── asr.py                    # Audio → Transcripts
+├── preprocess.py             # Transcripts → Chunks (hybrid semantic chunking)
+├── build_index.py            # Chunks → FAISS index
+├── qa.py                     # Index → Answers (hybrid retrieval + RAG)
+├── summary.py                # Chunks → Lecture Summary (hierarchical, New)
+└── config.py                 # Centralized configuration
 
-requirements.txt             # Dependencies
-README.md                    # This file
+requirements.txt
+README.md
 ```
 
 ---
@@ -213,7 +243,8 @@ README.md                    # This file
 | **Vector Search** | FAISS (CPU/GPU) | Efficient similarity retrieval |
 | **Keyword Search** | Rank-BM25 | Traditional keyword matching |
 | **Reranking** | Cross-Encoder (ms-marco-MiniLM) | Relevance scoring |
-| **LLM** | Meta-Llama-3.1-8B or Phi-3-mini | Answer generation with fallback |
+| **QA LLM** | Meta-Llama-3.1-8B or Phi-3-mini | Answer generation with fallback |
+| **Summarization LLM** | Microsoft Phi-3-mini-4k-instruct | Hierarchical lecture summarization |
 | **NLP Toolkit** | Hugging Face Transformers | Model loading & inference |
 | **Sentence Processing** | SentenceTransformers | Semantic embeddings |
 
@@ -221,6 +252,7 @@ README.md                    # This file
 - **ASR**: GPU recommended (>4GB VRAM for Whisper base)
 - **Indexing**: CPU-only or GPU (FAISS supports both)
 - **QA Inference**: 8GB+ GPU VRAM (Llama) or 2-4GB (Phi-3-mini)
+- **Summarization**: 2-4GB GPU VRAM (Phi-3-mini, `device_map="auto"`)
 - **Fallback**: All components support CPU-only inference
 
 ---
@@ -240,30 +272,34 @@ README.md                    # This file
 - Non-ASCII stripping (regex-based Unicode range match)
 - Sentence-level deduplication with sliding window
 - Isolated utterance removal (structural, not semantic)
-- **Benefit**: Transparent noise removal reproducible across domains
 
 ### 3. **Hybrid Retrieval (Semantic + Keyword)**
 **Problem**: Semantic search alone misses exact phrase matches; keyword search can't handle reformulations.
 **Solution**: Weighted fusion with deduplication:
 - Semantic results: 1.0 base score, tempered by document ranking position
 - Keyword results: 0.4 base score (secondary signal), only added if not already semantic-retrieved
-- **Benefit**: Best of both worlds—synonymy handling + exact phrase matching
 
 ### 4. **Strict Answer Format**
-**Problem**: LLMs pad under-constrained prompts with boilerplate; context- less generation leads to hallucination.
+**Problem**: LLMs pad under-constrained prompts with boilerplate.
 **Solution**:
-- Focused context: top-3 chunks only (~600 words) instead of 12 (~2400)
-- Strict format: "Write exactly one complete sentence" (vs. fuzzy "1-3 sentences")
-- Cap tokens: 150-token max (enough for complex but complete sentence)
-- **Benefit**: Cleaner, more concise, verifiable answers grounded in specific context
+- Focused context: top-3 chunks only (~600 words)
+- Strict format: "Write exactly one complete sentence"
+- 150-token max cap
 
 ### 5. **LLM Fallback Strategy**
 **Problem**: Llama 3.1 8B requires 8GB+ VRAM; may OOM on limited hardware.
 **Solution**: Graceful fallback:
 1. Attempt Llama-3.1-8B (bfloat16, 8-bit quantization)
-2. On OOM: Fall back to Phi-3-mini (float16, 4K context, lower memory footprint)
-3. Both models tested for QA task parity
-**Benefit**: Works across diverse hardware (high-end GPU, T4, CPU)
+2. On OOM: Fall back to Phi-3-mini (float16, 4K context)
+
+### 6. **Hierarchical Summarization with Chat Template** *(New)*
+**Problem**: Full transcripts exceed model context limits; naive summarization hallucinates synonyms.
+**Solution**:
+- Token-based section splitting (~2500 tokens) so each section fits Phi-3-mini's 4K context
+- Native `apply_chat_template` used instead of manual prompt formatting — ensures Phi-3 follows instructions correctly
+- `repetition_penalty=1.0` (disabled) — fixes a bug where the model was substituting bizarre synonyms due to over-penalization
+- `do_sample=False` — greedy decoding for factual, deterministic summaries
+- Two-stage output: per-section summaries → combined final summary
 
 ---
 
@@ -279,13 +315,13 @@ Outputs: `data/transcripts/lecture_N.txt`
 ```bash
 python src/preprocess.py
 ```
-Outputs: `data/chunks/chunks.json` (includes method tags, word counts)
+Outputs: `data/chunks/chunks.json`
 
 ### Step 3: Build FAISS Index
 ```bash
 python src/build_index.py
 ```
-Outputs: `data/faiss_index.bin`, `data/faiss_metadata.json`
+Outputs: `data/indexes/faiss_index.bin`, `data/indexes/faiss_metadata.json`
 
 ### Step 4: Run Interactive QA
 ```bash
@@ -293,20 +329,27 @@ python src/qa.py
 ```
 Asks for user question → Returns single-sentence answer grounded in transcripts
 
+### Step 5: Generate Lecture Summary *(New)*
+```bash
+python src/summary.py
+```
+Outputs: Full hierarchical lecture summary printed to console
+
 ---
 
 ## Performance & Scalability
 
 ### Current Scale
-- **Lectures**: 3 transcripts (lecture_1.txt, lecture_2.txt, lecture_3.txt)
-- **Chunk Database**: ~100-500 chunks (depends on transcript length and semantic boundaries)
+- **Lectures**: Supports any number of `.txt` transcripts
+- **Chunk Database**: ~100-500 chunks per lecture (depends on transcript length)
 - **Search Latency**: <100ms (FAISS semantic search)
 - **Answer Generation**: 2-5 seconds (LLM inference)
+- **Summarization**: ~30-90 seconds per lecture (Phi-3-mini, CPU/GPU)
 
 ### Scalability
-- **Horizontal**: Add lectures → rerun preprocessing + indexing (incremental update possible)
-- **Retrieval**: FAISS scales to millions of vectors (hierarchical indices available)
-- **Inference**: Batch question processing available (modify `qa.py` main loop)
+- **Horizontal**: Add lectures → rerun preprocessing + indexing
+- **Retrieval**: FAISS scales to millions of vectors
+- **Inference**: Batch question processing available
 - **Memory**: Metadata stored in JSON; FAISS index size = #chunks × 384 bytes × 4
 
 ---
@@ -319,7 +362,7 @@ Asks for user question → Returns single-sentence answer grounded in transcript
 4. **Fine-tuned Models**: Domain-specific embedding model for lecture corpus
 5. **Confidence Scores**: Output relevance & verifiability scores with answers
 6. **Web Interface**: Streamlit/Flask UI for non-technical access
-7. **Export to OpenAI GPT**: Integrate retrieved context with GPT-4 for premium answers
+7. **Summary Export**: Save summaries to file (TXT/PDF) instead of console-only output
 
 ---
 
@@ -332,84 +375,32 @@ pip install -r requirements.txt
 
 ### Full Pipeline
 ```bash
-# 1. Transcribe
 python src/asr.py
-
-# 2. Preprocess
-python src/preprocess.py
-
-# 3. Index
+python srcp/reprocess.py
 python src/build_index.py
-
-# 4. Query
-python src/qa.py
-```
-
-### Example Q&A Session
-```
-Ask a question: What did the professor say about machine learning?
-
-Expanded into 4 queries:
-  → 'What did the professor say about machine learning?'
-  → 'machine learning professor'
-  → 'machine learning fundamentals'
-  → 'introduced studying neural networks deep'
-
-Retrieving context (hybrid: semantic + keyword)...
-  Query '...' → 28 chunks
-  Query '...' → 25 chunks
-  Query '...' → 22 chunks
-  Query '...' → 19 chunks
-
-Total unique chunks: 64
-Reranking for best relevance...
-Top reranked: 15 chunks
-
-Context chunks for LLM:
-  1. [142w] The professor discussed supervised learning with neural networks...
-  2. [156w] Deep learning techniques have revolutionized computer vision...
-  3. [138w] Machine learning algorithms can be categorized into...
-  ... and 12 more
-
-Generating answer (this may take a moment)...
-
-============================================================
-ANSWER:
-============================================================
-The professor explained that machine learning is a subset of artificial intelligence that enables systems to learn from data without being explicitly programmed.
-============================================================
+python src/qa.py        # Interactive Q&A
+python src/summary.py   # Lecture summary
 ```
 
 ---
 
-## Project Metrics & Quality
-
-- **Transcription Accuracy**: Dependent on Whisper base model (typically 90-95% WER on lecture audio)
-- **Chunking Quality**: Semantic + size-boundary guards ensure 40-200 word chunks (measurable, deterministic)
-- **Answer Relevance**: Reranker provides continuous relevance scores (0-1); top-15 chunks filtered at high threshold
-- **Latency**:
-  - Embedding & search: <50ms per query
-  - Reranking: <100ms (15 chunks)
-  - LLM generation: 2-5 seconds
-  - **Total E2E**: ~5-8 seconds per question
-
----
-
-## Contributing & Troubleshooting
-
-### Common Issues
+## Common Issues & Troubleshooting
 
 1. **CUDA OOM on Llama**:
    - Automatic fallback to Phi-3-mini enabled
-   - Manual override in `qa.py` LLM selection
+   - Manual override: change `primary_llm` in `config.py`
 
 2. **No Transcripts Found**:
-   - Ensure `.wav` files in `data/audio/`
-   - Check that `AUDIO_DIR` path matches folder name
+   - Ensure audio files exist in `data/audio/`
+   - Supported formats: `.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`
 
 3. **Slow FAISS Search**:
-   - FAISS CPU is intentionally simple (IndexFlatL2)
-   - For >1M vectors, use IndexIVF or GPU FAISS
+   - FAISS CPU uses IndexFlatL2 (exact search)
+   - For >1M vectors, switch to IndexIVF or GPU FAISS
+
+4. **Summary Has Weird Synonyms / Repetition**:
+   - Ensure `repetition_penalty=1.0` in `summary.py` (already set)
+   - This was a known bug — fixed in current version
 
 ---
 
@@ -424,11 +415,5 @@ The professor explained that machine learning is a subset of artificial intellig
 
 ---
 
-## Contact & Support
-
-For issues, questions, or feature requests, please refer to project documentation or submit an issue.
-
----
-
-**Last Updated**: March 9, 2026  
-**Status**: Production-Ready (v0.46.1)
+**Last Updated**: March 11, 2026  
+**Status**: Production-Ready (v0.47.0)
